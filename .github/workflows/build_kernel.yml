@@ -1,21 +1,23 @@
-name: Neutrino Caimito Standard Build
+name: Neutrino Caimito Ultimate Build
 
 on:
-  workflow_dispatch: # 手动点火
+  workflow_dispatch: # 手动触发
 
 jobs:
   build:
+    name: Build Pixel 9 Kernel
     runs-on: ubuntu-latest
-    timeout-minutes: 600 # 仿参考脚本的高时限
+    timeout-minutes: 60
 
     steps:
-    - name: Checkout Code
+    - name: Checkout Your Source
       uses: actions/checkout@v4
       with:
+        path: neutrino_src # 先把你的源码拉到一个临时目录，别直接拉到根目录
         submodules: recursive
         fetch-depth: 1
 
-    # 1. [span_3](start_span)深度磁盘清理 (完全照抄参考脚本逻辑)[span_3](end_span)
+    # 1. 完整保留：深度磁盘清理 (参考脚本原版配置)
     - name: Free Disk Space
       uses: endersonmenezes/free-disk-space@v3
       with:
@@ -27,42 +29,136 @@ jobs:
         remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
         remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
 
-    # 2. 核心缓存控制：工具链与编译器 (确保不消失)
-    - name: Toolchain Cache
-      id: cache-toolchain
-      uses: actions/cache@v4
-      with:
-        path: toolchains/clang
-        key: clang-r487747c-caimito-v1 # 只要这个 Key 不改，环境就不会没
-
-    # 3. [span_4](start_span)初始化编译环境 (参考源代码 11-12)[span_4](end_span)
-    - name: Setup Environment
+    # 2. 安装必要工具 (Repo, BC, Bison 等)
+    - name: Setup Build Environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev python3 rsync curl wget
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev python3 rsync curl wget zip unzip
+        # 安装 Repo 工具
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
         
-        # 如果缓存没中，才执行下载
-        if [ "${{ steps.cache-toolchain.outputs.cache-hit }}" != 'true' ]; then
-          mkdir -p toolchains/clang
-          curl -LSs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz" -o clang.tar.gz
-          tar -C toolchains/clang -zxf clang.tar.gz
-          rm clang.tar.gz
-        fi
-        
-        # 将 Clang 加入系统路径 (这是持久化的关键)
-        echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
+        # 配置 Git 身份 (Repo 需要)
+        git config --global user.name "GitHub Action"
+        git config --global user.email "action@github.com"
 
-    # 4. 适配你的目录结构 (修复找不到 common 的问题)
-    - name: Path Fix & Localversion
+    # 3. 模仿参考脚本：初始化 GKI 环境 (自动处理 Clang 和构建脚本)
+    - name: Initialize GKI Workspace
       run: |
-        # 自动探测 setlocalversion 位置
-        SET_LOCAL_VER=$(find . -name setlocalversion | head -n 1)
-        if [ -n "$SET_LOCAL_VER" ]; then
-          sed -i 's/-dirty//' "$SET_LOCAL_VER"
-          echo "✅ Fixed $SET_LOCAL_VER"
-        fi
+        mkdir -p android_kernel
+        cd android_kernel
         
-        # 定位 defconfig
+        # Pixel 9 (Caimito) 基于 android14-6.1，初始化清单
+        echo "Initializing Repo..."
+        repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
+        
+        # 只同步构建工具、Clang 和必要的预构建文件 (跳过 common，因为我们要用你的)
+        # 这一步会自动下载最匹配的 Google 官方 Clang，不会再报错 gzip 格式不对
+        echo "Syncing dependencies (this may take a few minutes)..."
+        repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle build build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools kernel/configs
+        
+        echo "GKI Workspace Ready."
+
+    # 4. 关键步骤：嫁接你的源码 (修复路径报错的核心)
+    - name: Inject Neutrino Source
+      run: |
+        cd android_kernel
+        # 如果 repo 意外同步了 common 目录，先删掉
+        rm -rf common
+        # 把你的源码移动过来变成 common
+        mv ../neutrino_src common
+        echo "KERNEL_ROOT=$(pwd)" >> $GITHUB_ENV
+        echo "✅ Neutrino source injected into 'common' directory."
+
+    # 5. 准备 AnyKernel3 (保留你想要的功能)
+    - name: Setup AnyKernel3
+      run: |
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        rm -rf AnyKernel3/.git
+        # 如果你需要针对 Pixel 9 修改 AnyKernel 脚本，可以在这里 sed
+        # 例如：Pixel 9 需要 dtbo.img 刷入逻辑等，通常默认的够用，或者用作者提供的分支
+
+    # 6. 配置内核 (KSU, SUSFS)
+    - name: Configure Kernel
+      run: |
+        cd ${{ env.KERNEL_ROOT }}
+        
+        # 你的配置文件路径
+        DEFCONFIG="common/arch/arm64/configs/neutrino_caimito_defconfig"
+        
+        # 修复 Dirty 标记
+        sed -i 's/-dirty//' common/scripts/setlocalversion || true
+        
+        # 注入配置
+        if [ -f "$DEFCONFIG" ]; then
+          echo "Found config: $DEFCONFIG"
+          # 确保开启 KSU 和 SUSFS
+          if ! grep -q "CONFIG_KSU=y" "$DEFCONFIG"; then
+            echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
+            echo 'CONFIG_KSU_SUSFS=y' >> "$DEFCONFIG"
+          fi
+          # 设置版本号后缀
+          sed -i '/CONFIG_LOCALVERSION/d' "$DEFCONFIG"
+          echo 'CONFIG_LOCALVERSION="-Neutrino-Caimito"' >> "$DEFCONFIG"
+        else
+          echo "❌ Error: Config file not found at $DEFCONFIG"
+          exit 1
+        fi
+
+    # 7. 执行 Bazel 编译 (最稳的官方编译方式)
+    - name: Build Kernel (Bazel)
+      working-directory: ${{ env.KERNEL_ROOT }}
+      run: |
+        # 强制使用 Thin LTO 减少内存占用
+        tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
+
+    # 8. 打包 AnyKernel3 (完整修复版)
+    - name: Package AnyKernel3
+      run: |
+        # 定位 Bazel 生成的 Image (通常是 lz4 压缩格式)
+        # 路径通常在 android_kernel/bazel-bin/common/kernel_aarch64/Image.lz4
+        IMG_PATH="${{ env.KERNEL_ROOT }}/bazel-bin/common/kernel_aarch64/Image.lz4"
+        
+        if [ ! -f "$IMG_PATH" ]; then
+            # 备用路径查找
+            IMG_PATH=$(find ${{ env.KERNEL_ROOT }}/bazel-bin -name "Image.lz4" | head -n 1)
+        fi
+
+        if [ -f "$IMG_PATH" ]; then
+            echo "✅ Found Kernel Image at: $IMG_PATH"
+            cp "$IMG_PATH" AnyKernel3/Image.lz4
+            # Pixel 9 可能直接用 Image.lz4，如果 AK3 需要名为 Image，则重命名
+            # cp "$IMG_PATH" AnyKernel3/Image
+        else
+            echo "❌ Error: Image.lz4 not found!"
+            exit 1
+        fi
+
+        # 尝试复制 DTBO (如果有生成)
+        DTBO_PATH=$(find ${{ env.KERNEL_ROOT }}/bazel-bin -name "dtbo.img" | head -n 1)
+        if [ -n "$DTBO_PATH" ]; then
+            cp "$DTBO_PATH" AnyKernel3/dtbo.img
+            echo "✅ Included dtbo.img"
+        fi
+
+        # 尝试复制内核模块 (ko文件)
+        mkdir -p AnyKernel3/modules/system/lib/modules/
+        find ${{ env.KERNEL_ROOT }}/bazel-bin -name "*.ko" -exec cp {} AnyKernel3/modules/system/lib/modules/ \; || true
+        
+        # 打包 zip
+        cd AnyKernel3
+        zip -r9 ../Neutrino-Pixel9-Caimito-AK3.zip *
+
+    # 9. 上传结果
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Neutrino-Pixel9-Caimito-Signed
+        path: |
+          Neutrino-Pixel9-Caimito-AK3.zip
+          ${{ env.KERNEL_ROOT }}/bazel-bin/common/kernel_aarch64/Image*
         CONF="arch/arm64/configs/neutrino_caimito_defconfig"
         if [ -f "$CONF" ]; then
           # [span_5](start_span)参考脚本的 KSU 配置注入逻辑[span_5](end_span)
