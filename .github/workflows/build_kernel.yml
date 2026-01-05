@@ -1,12 +1,13 @@
-name: Build Neutrino Caimito (Pixel 9)
+name: Neutrino Caimito Standard Build
 
 on:
-  workflow_dispatch: # 手动触发构建
+  workflow_dispatch: # 手动点火
 
 jobs:
   build:
-    name: Build Kernel
     runs-on: ubuntu-latest
+    timeout-minutes: 600 # 仿参考脚本的高时限
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -14,92 +15,87 @@ jobs:
         submodules: recursive
         fetch-depth: 1
 
+    # 1. [span_3](start_span)深度磁盘清理 (完全照抄参考脚本逻辑)[span_3](end_span)
     - name: Free Disk Space
       uses: endersonmenezes/free-disk-space@v3
       with:
         remove_android: true
         remove_dotnet: true
+        remove_haskell: true
         remove_tool_cache: true
-        remove_folders: "/usr/share/swift /usr/local/lib/node_modules /usr/local/share/powershell"
+        remove_swap: true
+        remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
 
-    - name: Install Dependencies
+    # 2. 核心缓存控制：工具链与编译器 (确保不消失)
+    - name: Toolchain Cache
+      id: cache-toolchain
+      uses: actions/cache@v4
+      with:
+        path: toolchains/clang
+        key: clang-r487747c-caimito-v1 # 只要这个 Key 不改，环境就不会没
+
+    # 3. [span_4](start_span)初始化编译环境 (参考源代码 11-12)[span_4](end_span)
+    - name: Setup Environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev \
-        libelf-dev python3 tar cpio unzip rsync curl wget
-
-    - name: Setup Toolchain (Google Clang)
-      run: |
-        mkdir -p toolchains/clang
-        # 下载适配 Pixel 9 / GKI 6.1 的 Clang r487747c
-        curl -LSs https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz -o clang.tar.gz
-        tar -C toolchains/clang -zxf clang.tar.gz
-        # 将路径加入系统环境
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev python3 rsync curl wget
+        
+        # 如果缓存没中，才执行下载
+        if [ "${{ steps.cache-toolchain.outputs.cache-hit }}" != 'true' ]; then
+          mkdir -p toolchains/clang
+          curl -LSs "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz" -o clang.tar.gz
+          tar -C toolchains/clang -zxf clang.tar.gz
+          rm clang.tar.gz
+        fi
+        
+        # 将 Clang 加入系统路径 (这是持久化的关键)
         echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
 
-    - name: Customize Localversion & Config
+    # 4. 适配你的目录结构 (修复找不到 common 的问题)
+    - name: Path Fix & Localversion
       run: |
-        # 1. 修复 setlocalversion (去掉 -dirty)
+        # 自动探测 setlocalversion 位置
         SET_LOCAL_VER=$(find . -name setlocalversion | head -n 1)
         if [ -n "$SET_LOCAL_VER" ]; then
           sed -i 's/-dirty//' "$SET_LOCAL_VER"
           echo "✅ Fixed $SET_LOCAL_VER"
         fi
         
-        # 2. 定位并修改你的机型配置文件 (基于你提供的路径)
-        TARGET_CONFIG="arch/arm64/configs/neutrino_caimito_defconfig"
-        
-        if [ -f "$TARGET_CONFIG" ]; then
-          # 注入内核版本标识
-          echo "CONFIG_LOCALVERSION=\"-Neutrino-Caimito\"" >> "$TARGET_CONFIG"
-          # 确保 KSU 和 SUSFS 已开启 (虽然作者已集成，但加个保险)
-          echo "CONFIG_KSU=y" >> "$TARGET_CONFIG"
-          echo "CONFIG_KSU_SUSFS=y" >> "$TARGET_CONFIG"
-          echo "✅ Successfully customized $TARGET_CONFIG"
-        else
-          echo "❌ Error: Could not find $TARGET_CONFIG"
-          exit 1
+        # 定位 defconfig
+        CONF="arch/arm64/configs/neutrino_caimito_defconfig"
+        if [ -f "$CONF" ]; then
+          # [span_5](start_span)参考脚本的 KSU 配置注入逻辑[span_5](end_span)
+          cat >> "$CONF" << 'EOF'
+        CONFIG_KSU=y
+        CONFIG_KSU_SUSFS=y
+        CONFIG_LOCALVERSION="-Neutrino-Caimito"
+        EOF
+          echo "✅ Config $CONF patched."
         fi
 
-    - name: Build Kernel
+    # 5. [span_6](start_span)执行编译 (Pixel 9 专用 Bazel 模式)[span_6](end_span)
+    - name: Build Kernel (Bazel Mode)
       run: |
         set -ex
-        
-        # 定义环境变量
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-        export CC=clang
-        export LD=ld.lld
-        export NM=llvm-nm
-        export AR=llvm-ar
-        export OBJCOPY=llvm-objcopy
-        export OBJDUMP=llvm-objdump
-        export STRIP=llvm-strip
-
-        # 如果有作者的脚本优先运行
+        # 如果有 build_caimito.sh 则运行，否则尝试 Bazel
         if [ -f "build_caimito.sh" ]; then
           chmod +x build_caimito.sh
           ./build_caimito.sh
+        elif [ -f "tools/bazel" ]; then
+          ./tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
         else
-          # 使用传统的 Make 方式编译
-          make O=out neutrino_caimito_defconfig
-          make O=out -j$(nproc --all)
+          # 传统 Make 模式
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang neutrino_caimito_defconfig
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang -j$(nproc --all)
         fi
 
-    - name: Collect Results
-      run: |
-        mkdir -p output
-        # 查找生成的 Image (通常在 out/arch/arm64/boot/)
-        find out/arch/arm64/boot/ -name "Image*" -exec cp {} output/ \; || \
-        find arch/arm64/boot/ -name "Image*" -exec cp {} output/ \;
-        
-        # 复制可能存在的内核模块
-        find . -name "*.ko" -exec cp {} output/ \; || true
-
-    - name: Upload Artifacts
+    # 6. [span_7](start_span)[span_8](start_span)打包上传 (包含 AnyKernel3 逻辑)[span_7](end_span)[span_8](end_span)
+    - name: Upload Kernel
       uses: actions/upload-artifact@v4
       with:
         name: Neutrino-Kernel-Caimito
-        path: output/*
+        path: |
+          out/arch/arm64/boot/Image*
+          arch/arm64/boot/Image*
+          bazel-bin/common/kernel_aarch64/Image*
