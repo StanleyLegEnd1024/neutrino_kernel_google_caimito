@@ -1,197 +1,126 @@
-name: Neutrino Caimito Ultimate Build
+name: Neutrino Caimito Final
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch: # 必须有这一行，按钮才会出现
 
 jobs:
   build:
-    name: Build Pixel 9 Kernel
+    name: Build Kernel
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-
+    permissions:
+      contents: read
+      actions: write
+    
     steps:
-    - name: Checkout Your Source
+    - name: Checkout Source
       uses: actions/checkout@v4
       with:
-        path: neutrino_src # 先把你的源码拉到一个临时目录，别直接拉到根目录
+        path: neutrino_src
         submodules: recursive
         fetch-depth: 1
 
-    # 1. 完整保留：深度磁盘清理 (参考脚本原版配置)
+    # 1. 磁盘清理
     - name: Free Disk Space
       uses: endersonmenezes/free-disk-space@v3
       with:
         remove_android: true
         remove_dotnet: true
-        remove_haskell: true
         remove_tool_cache: true
-        remove_swap: true
         remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
 
-    # 2. 安装必要工具 (Repo, BC, Bison 等)
-    - name: Setup Build Environment
+    # 2. 准备构建环境 (Repo & Tools)
+    - name: Setup Tools
       run: |
         sudo apt-get update
         sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev python3 rsync curl wget zip unzip
-        # 安装 Repo 工具
+        
         mkdir -p ~/bin
         curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         echo "$HOME/bin" >> $GITHUB_PATH
         
-        # 配置 Git 身份 (Repo 需要)
-        git config --global user.name "GitHub Action"
-        git config --global user.email "action@github.com"
+        git config --global user.name "Bot"
+        git config --global user.email "bot@localhost"
 
-    # 3. 模仿参考脚本：初始化 GKI 环境 (自动处理 Clang 和构建脚本)
-    - name: Initialize GKI Workspace
+    # 3. 初始化 Google 环境
+    - name: Init GKI
       run: |
         mkdir -p android_kernel
         cd android_kernel
-        
-        # Pixel 9 (Caimito) 基于 android14-6.1，初始化清单
-        echo "Initializing Repo..."
+        # 初始化 Android 14 6.1 分支
         repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
-        
-        # 只同步构建工具、Clang 和必要的预构建文件 (跳过 common，因为我们要用你的)
-        # 这一步会自动下载最匹配的 Google 官方 Clang，不会再报错 gzip 格式不对
-        echo "Syncing dependencies (this may take a few minutes)..."
+        # 只同步必要部分
         repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle build build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools kernel/configs
-        
-        echo "GKI Workspace Ready."
 
-    # 4. 关键步骤：嫁接你的源码 (修复路径报错的核心)
-    - name: Inject Neutrino Source
+    # 4. 植入你的源码
+    - name: Inject Source
       run: |
         cd android_kernel
-        # 如果 repo 意外同步了 common 目录，先删掉
         rm -rf common
-        # 把你的源码移动过来变成 common
         mv ../neutrino_src common
         echo "KERNEL_ROOT=$(pwd)" >> $GITHUB_ENV
-        echo "✅ Neutrino source injected into 'common' directory."
 
-    # 5. 准备 AnyKernel3 (保留你想要的功能)
-    - name: Setup AnyKernel3
+    # 5. 配置内核 (KSU/SUSFS)
+    - name: Configure
       run: |
-        git clone https://github.com/osm0sis/AnyKernel3.git
-        rm -rf AnyKernel3/.git
-        # 如果你需要针对 Pixel 9 修改 AnyKernel 脚本，可以在这里 sed
-        # 例如：Pixel 9 需要 dtbo.img 刷入逻辑等，通常默认的够用，或者用作者提供的分支
-
-    # 6. 配置内核 (KSU, SUSFS)
-    - name: Configure Kernel
-      run: |
-        cd ${{ env.KERNEL_ROOT }}
-        
-        # 你的配置文件路径
+        cd $KERNEL_ROOT
         DEFCONFIG="common/arch/arm64/configs/neutrino_caimito_defconfig"
         
-        # 修复 Dirty 标记
+        # 修复 dirty
         sed -i 's/-dirty//' common/scripts/setlocalversion || true
         
-        # 注入配置
+        # 写入配置
         if [ -f "$DEFCONFIG" ]; then
-          echo "Found config: $DEFCONFIG"
-          # 确保开启 KSU 和 SUSFS
-          if ! grep -q "CONFIG_KSU=y" "$DEFCONFIG"; then
-            echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
-            echo 'CONFIG_KSU_SUSFS=y' >> "$DEFCONFIG"
-          fi
-          # 设置版本号后缀
+          grep -q "CONFIG_KSU=y" "$DEFCONFIG" || echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
+          grep -q "CONFIG_KSU_SUSFS=y" "$DEFCONFIG" || echo 'CONFIG_KSU_SUSFS=y' >> "$DEFCONFIG"
           sed -i '/CONFIG_LOCALVERSION/d' "$DEFCONFIG"
           echo 'CONFIG_LOCALVERSION="-Neutrino-Caimito"' >> "$DEFCONFIG"
         else
-          echo "❌ Error: Config file not found at $DEFCONFIG"
+          echo "Config not found!"
           exit 1
         fi
 
-    # 7. 执行 Bazel 编译 (最稳的官方编译方式)
-    - name: Build Kernel (Bazel)
+    # 6. 开始编译 (Bazel)
+    - name: Build
       working-directory: ${{ env.KERNEL_ROOT }}
       run: |
-        # 强制使用 Thin LTO 减少内存占用
+        # 使用 Thin LTO
         tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
 
-    # 8. 打包 AnyKernel3 (完整修复版)
-    - name: Package AnyKernel3
+    # 7. 打包 AnyKernel3
+    - name: Package AK3
       run: |
-        # 定位 Bazel 生成的 Image (通常是 lz4 压缩格式)
-        # 路径通常在 android_kernel/bazel-bin/common/kernel_aarch64/Image.lz4
-        IMG_PATH="${{ env.KERNEL_ROOT }}/bazel-bin/common/kernel_aarch64/Image.lz4"
+        # 克隆 AK3
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        rm -rf AnyKernel3/.git
         
-        if [ ! -f "$IMG_PATH" ]; then
-            # 备用路径查找
-            IMG_PATH=$(find ${{ env.KERNEL_ROOT }}/bazel-bin -name "Image.lz4" | head -n 1)
+        # 查找镜像 (lz4 或普通镜像)
+        # 使用 Shell 变量而非 Actions 变量，防止解析错误
+        IMG=$(find $KERNEL_ROOT/bazel-bin -name "Image.lz4" | head -n 1)
+        
+        if [ -z "$IMG" ]; then
+             IMG=$(find $KERNEL_ROOT/bazel-bin -name "Image" | head -n 1)
         fi
-
-        if [ -f "$IMG_PATH" ]; then
-            echo "✅ Found Kernel Image at: $IMG_PATH"
-            cp "$IMG_PATH" AnyKernel3/Image.lz4
-            # Pixel 9 可能直接用 Image.lz4，如果 AK3 需要名为 Image，则重命名
-            # cp "$IMG_PATH" AnyKernel3/Image
+        
+        if [ -f "$IMG" ]; then
+             echo "Found image: $IMG"
+             cp "$IMG" AnyKernel3/
         else
-            echo "❌ Error: Image.lz4 not found!"
-            exit 1
+             echo "Error: Kernel Image not found!"
+             exit 1
         fi
-
-        # 尝试复制 DTBO (如果有生成)
-        DTBO_PATH=$(find ${{ env.KERNEL_ROOT }}/bazel-bin -name "dtbo.img" | head -n 1)
-        if [ -n "$DTBO_PATH" ]; then
-            cp "$DTBO_PATH" AnyKernel3/dtbo.img
-            echo "✅ Included dtbo.img"
-        fi
-
-        # 尝试复制内核模块 (ko文件)
+        
+        # 查找模块
         mkdir -p AnyKernel3/modules/system/lib/modules/
-        find ${{ env.KERNEL_ROOT }}/bazel-bin -name "*.ko" -exec cp {} AnyKernel3/modules/system/lib/modules/ \; || true
+        find $KERNEL_ROOT/bazel-bin -name "*.ko" -exec cp {} AnyKernel3/modules/system/lib/modules/ \; || true
         
-        # 打包 zip
+        # 压缩
         cd AnyKernel3
-        zip -r9 ../Neutrino-Pixel9-Caimito-AK3.zip *
+        zip -r9 ../Neutrino-Pixel9-AK3.zip *
 
-    # 9. 上传结果
-    - name: Upload Build Artifacts
+    # 8. 上传
+    - name: Upload
       uses: actions/upload-artifact@v4
       with:
-        name: Neutrino-Pixel9-Caimito-Signed
-        path: |
-          Neutrino-Pixel9-Caimito-AK3.zip
-          ${{ env.KERNEL_ROOT }}/bazel-bin/common/kernel_aarch64/Image*
-        CONF="arch/arm64/configs/neutrino_caimito_defconfig"
-        if [ -f "$CONF" ]; then
-          # [span_5](start_span)参考脚本的 KSU 配置注入逻辑[span_5](end_span)
-          cat >> "$CONF" << 'EOF'
-        CONFIG_KSU=y
-        CONFIG_KSU_SUSFS=y
-        CONFIG_LOCALVERSION="-Neutrino-Caimito"
-        EOF
-          echo "✅ Config $CONF patched."
-        fi
-
-    # 5. [span_6](start_span)执行编译 (Pixel 9 专用 Bazel 模式)[span_6](end_span)
-    - name: Build Kernel (Bazel Mode)
-      run: |
-        set -ex
-        # 如果有 build_caimito.sh 则运行，否则尝试 Bazel
-        if [ -f "build_caimito.sh" ]; then
-          chmod +x build_caimito.sh
-          ./build_caimito.sh
-        elif [ -f "tools/bazel" ]; then
-          ./tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
-        else
-          # 传统 Make 模式
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang neutrino_caimito_defconfig
-          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC=clang -j$(nproc --all)
-        fi
-
-    # 6. [span_7](start_span)[span_8](start_span)打包上传 (包含 AnyKernel3 逻辑)[span_7](end_span)[span_8](end_span)
-    - name: Upload Kernel
-      uses: actions/upload-artifact@v4
-      with:
-        name: Neutrino-Kernel-Caimito
-        path: |
-          out/arch/arm64/boot/Image*
-          arch/arm64/boot/Image*
-          bazel-bin/common/kernel_aarch64/Image*
+        name: Neutrino-Pixel9-AK3
+        path: Neutrino-Pixel9-AK3.zip
