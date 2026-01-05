@@ -1,16 +1,14 @@
-name: Neutrino Caimito Final
+name: Neutrino Caimito Stable Build
 
 on:
-  workflow_dispatch: # 必须有这一行，按钮才会出现
+  workflow_dispatch: # 确保手动触发按钮可见
 
 jobs:
   build:
     name: Build Kernel
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
-    
+    timeout-minutes: 600
+
     steps:
     - name: Checkout Source
       uses: actions/checkout@v4
@@ -19,108 +17,96 @@ jobs:
         submodules: recursive
         fetch-depth: 1
 
-    # 1. 磁盘清理
+    # 1. [span_0](start_span)深度磁盘清理 (源自参考脚本，确保内存和空间充足)[span_0](end_span)
     - name: Free Disk Space
       uses: endersonmenezes/free-disk-space@v3
       with:
         remove_android: true
         remove_dotnet: true
+        remove_haskell: true
         remove_tool_cache: true
+        remove_swap: true
         remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
 
-    # 2. 准备构建环境 (Repo & Tools)
-    - name: Setup Tools
+    # 2. [span_1](start_span)安装 Repo 及构建依赖 (源自参考脚本)[span_1](end_span)
+    - name: Setup Environment
       run: |
         sudo apt-get update
         sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev python3 rsync curl wget zip unzip
-        
         mkdir -p ~/bin
         curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         echo "$HOME/bin" >> $GITHUB_PATH
-        
         git config --global user.name "Bot"
         git config --global user.email "bot@localhost"
 
-    # 3. 初始化 Google 环境
-    - name: Init GKI
+    # 3. [span_2](start_span)初始化 GKI 构建环境 (解决 Clang 下载及 gzip 报错问题)[span_2](end_span)
+    - name: Initialize GKI Workspace
       run: |
-        mkdir -p android_kernel
-        cd android_kernel
-        # 初始化 Android 14 6.1 分支
+        mkdir -p gki_work && cd gki_work
+        # [span_3](start_span)初始化 Pixel 9 对应的 Android 14 6.1 分支[span_3](end_span)
         repo init -u https://android.googlesource.com/kernel/manifest -b common-android14-6.1 --depth=1
-        # 只同步必要部分
-        repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle build build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools kernel/configs
+        # [span_4](start_span)同步构建所需的工具链和脚本，不包含 common[span_4](end_span)
+        repo sync -c -j$(nproc --all) --no-tags --no-clone-bundle --force-sync build build/kernel prebuilts/clang/host/linux-x86 prebuilts/build-tools kernel/configs
 
-    # 4. 植入你的源码
-    - name: Inject Source
+    # 4. 源码嫁接 (解决截图 45223 路径找不到 common/scripts 的问题)
+    - name: Inject Neutrino Source
       run: |
-        cd android_kernel
+        cd gki_work
         rm -rf common
+        # [span_5](start_span)将你的扁平化源码移动到 common 目录下，以适配 Bazel 路径[span_5](end_span)
         mv ../neutrino_src common
         echo "KERNEL_ROOT=$(pwd)" >> $GITHUB_ENV
 
-    # 5. 配置内核 (KSU/SUSFS)
-    - name: Configure
+    # 5. 内核基础配置 (仅修复版本标识，不添加 BBR)
+    - name: Configure Kernel
       run: |
         cd $KERNEL_ROOT
         DEFCONFIG="common/arch/arm64/configs/neutrino_caimito_defconfig"
-        
-        # 修复 dirty
+        # 移除 -dirty 标志
         sed -i 's/-dirty//' common/scripts/setlocalversion || true
-        
-        # 写入配置
+        # [span_6](start_span)确保基础路径正确[span_6](end_span)
         if [ -f "$DEFCONFIG" ]; then
-          grep -q "CONFIG_KSU=y" "$DEFCONFIG" || echo 'CONFIG_KSU=y' >> "$DEFCONFIG"
-          grep -q "CONFIG_KSU_SUSFS=y" "$DEFCONFIG" || echo 'CONFIG_KSU_SUSFS=y' >> "$DEFCONFIG"
-          sed -i '/CONFIG_LOCALVERSION/d' "$DEFCONFIG"
-          echo 'CONFIG_LOCALVERSION="-Neutrino-Caimito"' >> "$DEFCONFIG"
+          echo "Found config, ensuring correct settings..."
         else
-          echo "Config not found!"
+          echo "Error: $DEFCONFIG not found!"
           exit 1
         fi
 
-    # 6. 开始编译 (Bazel)
-    - name: Build
+    # 6. [span_7](start_span)执行 Bazel 编译 (源自参考脚本)[span_7](end_span)
+    - name: Build Kernel
       working-directory: ${{ env.KERNEL_ROOT }}
       run: |
-        # 使用 Thin LTO
+        # [span_8](start_span)使用 Thin LTO 模式，针对 Android 14 编译[span_8](end_span)
         tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
 
-    # 7. 打包 AnyKernel3
-    - name: Package AK3
+    # 7. [span_9](start_span)[span_10](start_span)打包 AnyKernel3 (源自参考脚本 178-181)[span_9](end_span)[span_10](end_span)
+    - name: Package AnyKernel3
       run: |
-        # 克隆 AK3
         git clone https://github.com/osm0sis/AnyKernel3.git
         rm -rf AnyKernel3/.git
-        
-        # 查找镜像 (lz4 或普通镜像)
-        # 使用 Shell 变量而非 Actions 变量，防止解析错误
-        IMG=$(find $KERNEL_ROOT/bazel-bin -name "Image.lz4" | head -n 1)
-        
-        if [ -z "$IMG" ]; then
-             IMG=$(find $KERNEL_ROOT/bazel-bin -name "Image" | head -n 1)
-        fi
+        # [span_11](start_span)搜寻 Bazel 生成的镜像文件[span_11](end_span)
+        IMG=$(find $KERNEL_ROOT/bazel-bin/common/kernel_aarch64/ -name "Image.lz4" | head -n 1)
+        [ -z "$IMG" ] && IMG=$(find $KERNEL_ROOT/bazel-bin/common/kernel_aarch64/ -name "Image" | head -n 1)
         
         if [ -f "$IMG" ]; then
-             echo "Found image: $IMG"
-             cp "$IMG" AnyKernel3/
+          cp "$IMG" AnyKernel3/
+          echo "✅ Image found and copied to AnyKernel3"
         else
-             echo "Error: Kernel Image not found!"
-             exit 1
+          echo "❌ Error: Kernel Image not found!"
+          exit 1
         fi
         
-        # 查找模块
-        mkdir -p AnyKernel3/modules/system/lib/modules/
-        find $KERNEL_ROOT/bazel-bin -name "*.ko" -exec cp {} AnyKernel3/modules/system/lib/modules/ \; || true
+        # [span_12](start_span)打包模块 (如果有)[span_12](end_span)
+        find $KERNEL_ROOT/bazel-bin -name "*.ko" -exec cp {} AnyKernel3/ \; || true
         
-        # 压缩
         cd AnyKernel3
-        zip -r9 ../Neutrino-Pixel9-AK3.zip *
+        zip -r9 ../Neutrino-Caimito-AK3.zip *
 
-    # 8. 上传
-    - name: Upload
+    # 8. [span_13](start_span)上传产物[span_13](end_span)
+    - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Neutrino-Pixel9-AK3
-        path: Neutrino-Pixel9-AK3.zip
+        name: Neutrino-Pixel9-Caimito
+        path: Neutrino-Caimito-AK3.zip
