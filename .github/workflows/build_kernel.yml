@@ -1,107 +1,77 @@
-name: Build Neutrino Kernel for Pixel 9 (Caimito)
+name: Build Neutrino Caimito (Pixel 9)
 
 on:
-  workflow_dispatch: # 允许手动触发构建
-  push:
-    branches:
-      - main
-      - neutrino-google-caimito-6.1 # 根据你的实际分支名修改，如果不确定可以保留这个或者用 '*'
+  workflow_dispatch: # 手动触发
 
 jobs:
-  build-kernel:
+  build:
+    name: Build Kernel for Pixel 9
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      actions: write
-
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
       with:
-        ref: ${{ github.event.ref }}
         submodules: recursive
-        fetch-depth: 0
 
-    - name: Setup Build Environment
+    # 1. 释放磁盘空间 (GKI/Bazel 编译极其占用空间，这是从你给的脚本里学的)
+    - name: Free Disk Space
+      uses: endersonmenezes/free-disk-space@v3
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_tool_cache: true
+        remove_folders: "/usr/share/swift /usr/local/lib/node_modules /usr/local/share/powershell"
+
+    # 2. 安装必要工具
+    - name: Setup Environment
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev \
-        libelf-dev python3 tar cpio unzip rsync curl wget
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev python3 curl wget rsync
+        # 准备 repo 工具
+        mkdir -p ~/bin
+        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
 
-    - name: Download Clang Toolchain
+    # 3. 自定义内核名称 (仿照你给的脚本逻辑)
+    - name: Customize Localversion
       run: |
-        mkdir -p toolchains/clang
-        # 下载 Android 官方 Clang (r416183b 是 Android 14/GKI 常用版本，如需更新可修改)
-        # 如果 Neutrino 推荐特定版本，请在此调整
-        wget https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/master/clang-r487747c.tar.gz -O clang.tar.gz
-        tar -C toolchains/clang -zxf clang.tar.gz
-        
-        # 设置环境变量
-        echo "PATH=$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH" >> $GITHUB_ENV
-        echo "CLANG_PATH=$GITHUB_WORKSPACE/toolchains/clang" >> $GITHUB_ENV
+        # 去掉 -dirty 标志并添加 Neutrino 标识
+        sed -i 's/-dirty//' ./common/scripts/setlocalversion || true
+        # 如果你想改内核名字，可以在这里操作
+        echo "CONFIG_LOCALVERSION=\"-Neutrino-Caimito\"" >> common/arch/arm64/configs/gki_defconfig
 
-    - name: Build Kernel (Attempt 1: build_caimito.sh)
-      id: build_script
+    # 4. 执行 Bazel 编译 (Pixel 9 专用方式)
+    - name: Build with Bazel
       run: |
-        if [ -f "build_caimito.sh" ]; then
-          echo "Found build_caimito.sh, granting permissions..."
-          chmod +x build_caimito.sh
-          
-          # 尝试修改脚本以适配 CI 环境（如果脚本假定有上级 prebuilts 目录）
-          # 这一步是预防性措施，强制指定 Clang 路径
-          sed -i 's|^CLANG_PREBUILT_BIN=.*|CLANG_PREBUILT_BIN=../toolchains/clang/bin|g' build_caimito.sh || true
-          
-          echo "Running build script..."
-          # 传递参数，通常 GKI 构建不需要过多参数，但有些脚本需要
-          ./build_caimito.sh
-          echo "BUILD_STATUS=success" >> $GITHUB_ENV
-        else
-          echo "build_caimito.sh not found, skipping to generic build..."
-          echo "BUILD_STATUS=skipped" >> $GITHUB_ENV
-        fi
+        # 使用 Thin LTO 提速并减少内存消耗
+        # Pixel 9 的 target 通常是 //common:kernel_aarch64_dist
+        set -ex
+        chmod +x tools/bazel
+        ./tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
 
-    - name: Build Kernel (Fallback: Generic Make)
-      if: env.BUILD_STATUS == 'skipped'
+    # 5. 整理产物 (Image 和 模块)
+    - name: Collect Artifacts
       run: |
-        echo "Using generic GKI build method..."
-        export ARCH=arm64
-        export SUBARCH=arm64
-        export CROSS_COMPILE=aarch64-linux-gnu-
-        export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-        export CC=clang
-        export LD=ld.lld
-        
-        # 尝试寻找 defconfig，Pixel 9 通常是 caimito_defconfig 或 gki_defconfig
-        if [ -f "arch/arm64/configs/caimito_defconfig" ]; then
-            make caimito_defconfig
-        elif [ -f "arch/arm64/configs/gki_defconfig" ]; then
-            make gki_defconfig
-        else
-            echo "No suitable defconfig found!"
-            exit 1
-        fi
-        
-        make -j$(nproc)
+        mkdir -p output
+        # Bazel 产物通常在 bazel-bin 目录下
+        find bazel-bin/common/kernel_aarch64/ -name "Image*" -exec cp {} output/ \;
+        find bazel-bin/common/kernel_aarch64/ -name "*.ko" -exec cp {} output/ \;
 
-    - name: Locate Artifacts
-      id: locate_artifacts
+    # 6. 打包 AnyKernel3 (如果你有这个需求)
+    - name: Prepare AnyKernel3
       run: |
-        echo "Searching for kernel images..."
-        # 查找常见的内核镜像文件
-        find . -name "Image*" -o -name "*.ko" -o -name "boot.img" -o -name "dtbo.img"
-        
-        # 创建输出目录
-        mkdir -p release_artifacts
-        
-        # 尝试复制关键文件
-        find out/ -name "Image.lz4" -exec cp {} release_artifacts/ \; || true
-        find out/ -name "Image" -exec cp {} release_artifacts/ \; || true
-        find out/ -name "*.ko" -exec cp {} release_artifacts/ \; || true
-        # 如果有 AnyKernel3 打包脚本生成的 zip
-        find . -name "*.zip" -exec cp {} release_artifacts/ \; || true
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        rm -rf AnyKernel3/.git
+        cp output/Image AnyKernel3/
+        # 根据 Pixel 9 调整 anykernel.sh 的逻辑可以在这里用 sed 改
+        zip -r9 neutrino-kernel.zip AnyKernel3/*
 
-    - name: Upload Artifacts
+    # 7. 上传
+    - name: Upload Results
       uses: actions/upload-artifact@v4
       with:
-        name: kernel-build-release
-        path: release_artifacts/*
+        name: Neutrino-Caimito-Kernel
+        path: |
+          output/Image
+          neutrino-kernel.zip
