@@ -1,19 +1,19 @@
 name: Build Neutrino Caimito (Pixel 9)
 
 on:
-  workflow_dispatch: # 手动触发
+  workflow_dispatch: # 手动触发构建
 
 jobs:
   build:
-    name: Build Kernel for Pixel 9
+    name: Build Kernel
     runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
       with:
         submodules: recursive
+        fetch-depth: 1
 
-    # 1. 释放磁盘空间 (GKI/Bazel 编译极其占用空间，这是从你给的脚本里学的)
     - name: Free Disk Space
       uses: endersonmenezes/free-disk-space@v3
       with:
@@ -22,56 +22,84 @@ jobs:
         remove_tool_cache: true
         remove_folders: "/usr/share/swift /usr/local/lib/node_modules /usr/local/share/powershell"
 
-    # 2. 安装必要工具
-    - name: Setup Environment
+    - name: Install Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y git build-essential bc bison flex libssl-dev python3 curl wget rsync
-        # 准备 repo 工具
-        mkdir -p ~/bin
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        echo "$HOME/bin" >> $GITHUB_PATH
+        sudo apt-get install -y git build-essential bc bison flex libssl-dev libncurses5-dev \
+        libelf-dev python3 tar cpio unzip rsync curl wget
 
-    # 3. 自定义内核名称 (仿照你给的脚本逻辑)
-    - name: Customize Localversion
+    - name: Setup Toolchain (Google Clang)
       run: |
-        # 去掉 -dirty 标志并添加 Neutrino 标识
-        sed -i 's/-dirty//' ./common/scripts/setlocalversion || true
-        # 如果你想改内核名字，可以在这里操作
-        echo "CONFIG_LOCALVERSION=\"-Neutrino-Caimito\"" >> common/arch/arm64/configs/gki_defconfig
+        mkdir -p toolchains/clang
+        # 下载适配 Pixel 9 / GKI 6.1 的 Clang r487747c
+        curl -LSs https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz -o clang.tar.gz
+        tar -C toolchains/clang -zxf clang.tar.gz
+        # 将路径加入系统环境
+        echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
 
-    # 4. 执行 Bazel 编译 (Pixel 9 专用方式)
-    - name: Build with Bazel
+    - name: Customize Localversion & Config
       run: |
-        # 使用 Thin LTO 提速并减少内存消耗
-        # Pixel 9 的 target 通常是 //common:kernel_aarch64_dist
+        # 1. 修复 setlocalversion (去掉 -dirty)
+        SET_LOCAL_VER=$(find . -name setlocalversion | head -n 1)
+        if [ -n "$SET_LOCAL_VER" ]; then
+          sed -i 's/-dirty//' "$SET_LOCAL_VER"
+          echo "✅ Fixed $SET_LOCAL_VER"
+        fi
+        
+        # 2. 定位并修改你的机型配置文件 (基于你提供的路径)
+        TARGET_CONFIG="arch/arm64/configs/neutrino_caimito_defconfig"
+        
+        if [ -f "$TARGET_CONFIG" ]; then
+          # 注入内核版本标识
+          echo "CONFIG_LOCALVERSION=\"-Neutrino-Caimito\"" >> "$TARGET_CONFIG"
+          # 确保 KSU 和 SUSFS 已开启 (虽然作者已集成，但加个保险)
+          echo "CONFIG_KSU=y" >> "$TARGET_CONFIG"
+          echo "CONFIG_KSU_SUSFS=y" >> "$TARGET_CONFIG"
+          echo "✅ Successfully customized $TARGET_CONFIG"
+        else
+          echo "❌ Error: Could not find $TARGET_CONFIG"
+          exit 1
+        fi
+
+    - name: Build Kernel
+      run: |
         set -ex
-        chmod +x tools/bazel
-        ./tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
+        
+        # 定义环境变量
+        export ARCH=arm64
+        export SUBARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+        export CC=clang
+        export LD=ld.lld
+        export NM=llvm-nm
+        export AR=llvm-ar
+        export OBJCOPY=llvm-objcopy
+        export OBJDUMP=llvm-objdump
+        export STRIP=llvm-strip
 
-    # 5. 整理产物 (Image 和 模块)
-    - name: Collect Artifacts
+        # 如果有作者的脚本优先运行
+        if [ -f "build_caimito.sh" ]; then
+          chmod +x build_caimito.sh
+          ./build_caimito.sh
+        else
+          # 使用传统的 Make 方式编译
+          make O=out neutrino_caimito_defconfig
+          make O=out -j$(nproc --all)
+        fi
+
+    - name: Collect Results
       run: |
         mkdir -p output
-        # Bazel 产物通常在 bazel-bin 目录下
-        find bazel-bin/common/kernel_aarch64/ -name "Image*" -exec cp {} output/ \;
-        find bazel-bin/common/kernel_aarch64/ -name "*.ko" -exec cp {} output/ \;
+        # 查找生成的 Image (通常在 out/arch/arm64/boot/)
+        find out/arch/arm64/boot/ -name "Image*" -exec cp {} output/ \; || \
+        find arch/arm64/boot/ -name "Image*" -exec cp {} output/ \;
+        
+        # 复制可能存在的内核模块
+        find . -name "*.ko" -exec cp {} output/ \; || true
 
-    # 6. 打包 AnyKernel3 (如果你有这个需求)
-    - name: Prepare AnyKernel3
-      run: |
-        git clone https://github.com/osm0sis/AnyKernel3.git
-        rm -rf AnyKernel3/.git
-        cp output/Image AnyKernel3/
-        # 根据 Pixel 9 调整 anykernel.sh 的逻辑可以在这里用 sed 改
-        zip -r9 neutrino-kernel.zip AnyKernel3/*
-
-    # 7. 上传
-    - name: Upload Results
+    - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: Neutrino-Caimito-Kernel
-        path: |
-          output/Image
-          neutrino-kernel.zip
+        name: Neutrino-Kernel-Caimito
+        path: output/*
