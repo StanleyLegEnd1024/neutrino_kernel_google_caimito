@@ -1,13 +1,21 @@
-name: Neutrino Caimito Ultimate Build
+name: Test Kernel Build Start
 
 on:
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build Kernel for Pixel 9
+    name: Test Compilation Start
     runs-on: ubuntu-latest
-    timeout-minutes: 600
+    timeout-minutes: 60
+
+    env:
+      KERNEL_DIR: common
+      OUT_DIR: out
+      ARCH: arm64
+      SUBARCH: arm64
+      KBUILD_BUILD_HOST: GitHub-Action
+      KBUILD_BUILD_USER: neutrino
 
     steps:
     - name: Checkout Source
@@ -17,150 +25,52 @@ jobs:
         submodules: recursive
         fetch-depth: 1
 
-    # 1. 深度磁盘清理
-    - name: Free Disk Space
-      uses: endersonmenezes/free-disk-space@v3
-      with:
-        remove_android: true
-        remove_dotnet: true
-        remove_haskell: true
-        remove_tool_cache: true
-        remove_swap: true
-        remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
-        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-
-    # 2. 缓存工具链
-    - name: Cache Toolchain
-      id: cache-toolchain
-      uses: actions/cache@v4
-      with:
-        path: toolchains/clang
-        key: neutron-clang-19-${{ runner.os }}
-
-    # 3. 设置环境与下载 Neutron Clang
     - name: Setup Environment
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           git build-essential bc bison flex libssl-dev libncurses5-dev \
           libelf-dev python3 rsync curl wget zip unzip file cpio lld \
-          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
-        
-        mkdir -p toolchains/clang
-        
-        if [ "${{ steps.cache-toolchain.outputs.cache-hit }}" != 'true' ]; then
-          echo "⬇️ Downloading Neutron Clang..."
-          cd toolchains/clang
-          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
-          chmod +x antman
-          ./antman -S
-          cd ../..
-        else
-          echo "✅ Clang cache restored!"
-        fi
-        
-        echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
-        
-    # 4. 准备 AnyKernel3
-    - name: Setup AnyKernel3
-      run: |
-        git clone https://github.com/osm0sis/AnyKernel3.git -b master
-        rm -rf AnyKernel3/.git
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu \
+          device-tree-compiler
 
-    # 5. 执行编译
-    - name: Build Kernel
+    - name: Download Neutron Clang
+      run: |
+        mkdir -p toolchains/clang
+        cd toolchains/clang
+        curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+        chmod +x antman
+        ./antman -S
+        echo "$GITHUB_WORKSPACE/toolchains/clang/bin" >> $GITHUB_PATH
+
+    - name: Build Kernel (Test)
       run: |
         set -e
+        export ROOT_DIR=$(pwd)
+        export KERNEL_DIR=common
+        export OUT_DIR=out
+        
+        # 核心 GKI 变量（解决死循环的关键）
+        export KMI_GENERATION=11
+        export LLVM=1
+        export LLVM_IAS=1
+        export KCFLAGS="-D__ANDROID_COMMON_KERNEL__"
+        
+        # 显式设置 PATH
+        export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+        
         cd common
         
-        # 检测构建系统
-        if [ -f "tools/bazel" ]; then
-          echo "🚀 Building with Bazel..."
-          ./tools/bazel build --config=fast --lto=thin //common:kernel_aarch64_dist
-        else
-          echo "🔨 Building with Make..."
-          
-          # 使用你配置好的 defconfig
-          make O=../out ARCH=arm64 neutrino_caimito_defconfig
-          
-          make O=../out ARCH=arm64 \
-               LLVM=1 \
-               LLVM_IAS=1 \
-               CROSS_COMPILE=aarch64-linux-gnu- \
-               CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
-               -j$(nproc --all)
-        fi
-
-    # 6. 智能打包
-    - name: Package AK3
-      run: |
-        # 多路径查找内核镜像
-        for path in \
-          "common/bazel-bin/common/kernel_aarch64/Image.lz4" \
-          "out/arch/arm64/boot/Image.lz4" \
-          "out/arch/arm64/boot/Image" \
-          "common/out/arch/arm64/boot/Image.lz4" \
-          "common/out/arch/arm64/boot/Image"
-        do
-          if [ -f "$path" ]; then
-            IMG="$path"
-            break
-          fi
-        done
+        echo "🔹 Configuring Kernel..."
+        make O=../$OUT_DIR ARCH=arm64 neutrino_caimito_defconfig
         
-        # 如果上面没找到，尝试全局搜索
-        if [ -z "$IMG" ]; then
-          IMG=$(find . -name "Image.lz4" -o -name "Image" | grep -E "(boot|bazel-bin)" | head -n 1)
-        fi
-
-        if [ -f "$IMG" ]; then
-          echo "✅ Found kernel: $IMG"
-          cp "$IMG" AnyKernel3/
-          
-          # 统一命名
-          if [[ "$IMG" == *"Image.lz4"* ]]; then
-            echo "Kernel is compressed (LZ4)"
-          else
-            echo "Kernel is uncompressed, renaming..."
-            mv AnyKernel3/Image AnyKernel3/Image.lz4 2>/dev/null || true
-          fi
-        else
-          echo "❌ No kernel image found!"
-          echo "Searching all Image files:"
-          find . -name "Image*" -type f
-          exit 1
-        fi
-        
-        # 复制内核模块
-        echo "📦 Copying kernel modules..."
-        find out -name "*.ko" -exec cp {} AnyKernel3/ \; 2>/dev/null || true
-        find common/bazel-bin -name "*.ko" -exec cp {} AnyKernel3/ \; 2>/dev/null || true
-        
-        # 显示打包内容
-        echo "Package contents:"
-        ls -lh AnyKernel3/
-        
-        # 打包
-        cd AnyKernel3
-        zip -r9 ../Neutrino-Caimito-AK3.zip * -x "*.git*"
-        cd ..
-        echo "✅ Package size: $(du -h Neutrino-Caimito-AK3.zip | cut -f1)"
-        
-    # 7. 上传
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: Neutrino-Kernel-Caimito-${{ github.run_number }}
-        path: Neutrino-Caimito-AK3.zip
-        compression-level: 0
-
-    # 8. 上传构建日志（失败时有用）
-    - name: Upload Build Logs
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs-${{ github.run_number }}
-        path: |
-          out/.config
-          out/build.log
-          common/bazel-*
+        echo "🔹 Starting Build..."
+        # 只编译 Image，足以验证编译是否正常开始
+        make O=../$OUT_DIR ARCH=arm64 \
+             LLVM=1 LLVM_IAS=1 \
+             CROSS_COMPILE=aarch64-linux-gnu- \
+             CROSS_COMPILE_COMPAT=arm-linux-gnueabi- \
+             LD=ld.lld AR=llvm-ar NM=llvm-nm \
+             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+             -j$(nproc --all) \
+             Image
